@@ -5,9 +5,8 @@ import { splitOutsideDisk } from "./partialErase";
 export const MAX_DOCUMENT_POINTS = 20000;
 
 export type EditOp =
-  | { type: "cut"; before: Stroke[] }
   | { type: "add"; strokeId: string }
-  | { type: "erase"; entries: { stroke: Stroke; index: number }[] };
+  | { type: "erase"; before: Stroke[] };
 
 /**
  * 文档模型：笔画集合 + 撤销栈 + 编辑代次。
@@ -16,13 +15,14 @@ export type EditOp =
  *   Worker 平滑结果携带 (strokeId, gen)，仅当 gen 与当前 editGen 一致
  *   且笔画仍存在时才被接受，旧结果无法复活已擦除的笔画。
  * - applySmoothed 不是可撤销编辑，不推进 editGen，也不改动保存的采样。
+ * - 一次擦除（按下到抬起）内的整条删除与局部切割合并为一个可撤销操作：
+ *   趟开始时快照笔画数组，趟内任何改动都只累积，endErasePass 才入栈。
  */
 export class Document {
   private strokes: Stroke[] = [];
   private undoStack: EditOp[] = [];
   private listeners = new Set<() => void>();
-  private erasePass: { entries: { stroke: Stroke; index: number }[] } | null =
-    null;
+  private erasePass: { before: Stroke[]; changed: boolean } | null = null;
   private nextId = 1;
 
   editGen = 0;
@@ -82,43 +82,84 @@ export class Document {
     return stroke;
   }
 
-  partialEraseAt(x: number, y: number, radius: number): void {
-    if (!this.erasePass) throw new Error("no erase pass");
-    const before = this.strokes.slice();
-    this.strokes = this.strokes.flatMap((stroke) =>
-      splitOutsideDisk(stroke.points, x, y, radius).map((points) => ({
-        ...stroke,
-        points,
-      })),
-    );
-    this.totalPoints = this.strokes.reduce((n, s) => n + s.points.length, 0);
-    this.undoStack.push({ type: "cut", before });
-    this.emit();
-  }
-
-  beginErasePass(): void {
-    if (this.erasePass) throw new Error("erase pass already open");
-    this.erasePass = { entries: [] };
-  }
-
-  /** 擦除过程中命中即整条删除；删除记录累积，endErasePass 合并为一个可撤销操作。 */
-  eraseStroke(id: string): boolean {
-    if (!this.erasePass) throw new Error("no open erase pass");
-    const index = this.strokes.findIndex((s) => s.id === id);
-    if (index < 0) return false;
-    const [stroke] = this.strokes.splice(index, 1);
-    this.totalPoints -= stroke.points.length;
-    this.erasePass.entries.push({ stroke, index });
+  /**
+   * 局部擦除：用橡皮圆盘裁剪每条笔迹，圆盘外的部分成为独立片段。
+   *
+   * - 片段是新笔画（新 id、smoothed 清空），旧笔迹的平滑缓存与途中的
+   *   平滑结果都不会把切割前的形状带回来；
+   * - 未被动过的笔画保留原对象（id、平滑缓存、撤销引用都不变）；
+   * - 切割是原子的：先算完整结果，会使文档超过两万点上限时整体放弃，
+   *   保持本次切割前状态，不留部分完成的操作；
+   * - 一趟擦除（beginErasePass..endErasePass）内的所有切割与删除
+   *   合并为一个可撤销操作。
+   *
+   * 返回本次是否真的切掉了什么。
+   */
+  partialEraseAt(x: number, y: number, radius: number): boolean {
+    const pass = this.erasePass;
+    if (!pass) throw new Error("no erase pass");
+    // 先完整计算，不改动文档
+    const plan = this.strokes.map((stroke) => {
+      const fragments = splitOutsideDisk(stroke.points, x, y, radius);
+      const unchanged =
+        fragments.length === 1 &&
+        fragments[0].length === stroke.points.length &&
+        fragments[0].every((p, i) => p === stroke.points[i]);
+      return { stroke, fragments, unchanged };
+    });
+    if (plan.every((p) => p.unchanged)) return false;
+    let total = 0;
+    for (const p of plan)
+      for (const f of p.fragments) total += f.length;
+    if (total > MAX_DOCUMENT_POINTS) return false; // 超上限：保持切割前状态
+    const next: Stroke[] = [];
+    for (const { stroke, fragments, unchanged } of plan) {
+      if (unchanged) {
+        next.push(stroke);
+        continue;
+      }
+      for (const points of fragments) {
+        next.push({
+          ...stroke,
+          id: `stroke-${this.nextId++}`,
+          points,
+          smoothed: null, // 旧平滑缓存属于切割前形状，不得带入片段
+          gen: this.editGen,
+        });
+      }
+    }
+    this.strokes = next;
+    this.totalPoints = total;
+    pass.changed = true;
     this.emit();
     return true;
   }
 
+  beginErasePass(): void {
+    if (this.erasePass) throw new Error("erase pass already open");
+    this.erasePass = { before: this.strokes.slice(), changed: false };
+  }
+
+  /** 擦除过程中命中即整条删除；与局部切割一起累积，endErasePass 合并为一个可撤销操作。 */
+  eraseStroke(id: string): boolean {
+    const pass = this.erasePass;
+    if (!pass) throw new Error("no open erase pass");
+    const index = this.strokes.findIndex((s) => s.id === id);
+    if (index < 0) return false;
+    const [stroke] = this.strokes.splice(index, 1);
+    this.totalPoints -= stroke.points.length;
+    pass.changed = true;
+    this.emit();
+    return true;
+  }
+
+  /** 结束一趟擦除：趟内有任何删除/切割才合并入栈为一个可撤销操作。 */
   endErasePass(): void {
     const pass = this.erasePass;
     this.erasePass = null;
-    if (!pass || pass.entries.length === 0) return;
+    if (!pass || !pass.changed) return;
     this.editGen++;
-    this.undoStack.push({ type: "erase", entries: pass.entries });
+    this.undoStack.push({ type: "erase", before: pass.before });
     this.emit();
   }
 
@@ -135,22 +176,17 @@ export class Document {
   undo(): boolean {
     const op = this.undoStack.pop();
     if (!op) return false;
-    if (op.type === "cut") {
-      this.strokes = op.before;
-      this.totalPoints = this.strokes.reduce((n, s) => n + s.points.length, 0);
-    } else if (op.type === "add") {
+    if (op.type === "add") {
       const index = this.strokes.findIndex((s) => s.id === op.strokeId);
       if (index >= 0) {
         const [stroke] = this.strokes.splice(index, 1);
         this.totalPoints -= stroke.points.length;
       }
     } else {
-      // 按删除的逆序、以删除时记录的下标插回，恢复原有相对顺序。
-      for (const e of [...op.entries].reverse()) {
-        const at = Math.min(e.index, this.strokes.length);
-        this.strokes.splice(at, 0, e.stroke);
-        this.totalPoints += e.stroke.points.length;
-      }
+      // 一次擦除（整条删除与局部切割的合并）整体回滚到趟前快照，
+      // 笔画的相对顺序、采样与点数随之完整恢复。
+      this.strokes = op.before.slice();
+      this.totalPoints = this.strokes.reduce((n, s) => n + s.points.length, 0);
     }
     this.editGen++;
     this.emit();
@@ -158,8 +194,8 @@ export class Document {
   }
 
   /**
-   * 接收 Worker 平滑结果。代次不符（文档已编辑）或笔画已不存在（已擦除）
-   * 时丢弃；只写 smoothed 缓存，绝不触碰保存的采样 points。
+   * 接收 Worker 平滑结果。代次不符（文档已编辑）或笔画已不存在（已擦除/
+   * 已被切割替换）时丢弃；只写 smoothed 缓存，绝不触碰保存的采样 points。
    */
   applySmoothed(strokeId: string, gen: number, points: Sample[]): boolean {
     if (gen !== this.editGen) return false;

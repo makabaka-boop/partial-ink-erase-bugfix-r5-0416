@@ -7,7 +7,7 @@
 ```bash
 npm install
 npm run dev      # 开发
-npm test         # 测试（vitest，34 个用例）
+npm test         # 测试（vitest，49 个用例）
 npm run build    # 类型检查 + 生产构建
 ```
 
@@ -16,6 +16,7 @@ npm run build    # 类型检查 + 生产构建
 | 模块 | 职责 |
 | --- | --- |
 | `src/model/document.ts` | 笔画集合、撤销栈、编辑代次 `editGen`、两万点上限 |
+| `src/model/partialErase.ts` | 局部擦除：圆盘与折线求交、切口插值、片段拆分 |
 | `src/model/geometry.ts` | 视图变换（缩放/平移）、橡皮命中判定 |
 | `src/input/pointerInput.ts` | 指针状态机：合并事件、预测点、提交/撤销笔画 |
 | `src/input/domAdapter.ts` | PointerEvent → 输入层，`setPointerCapture` |
@@ -30,6 +31,7 @@ npm run build    # 类型检查 + 生产构建
 - **压力与坐标绑定笔画**：采样带 `pointerId`，非活动指针的输入被忽略。
 - **抬笔提交**：`pointerup` 提交完整笔画；`pointercancel` / `lostpointercapture` 丢弃未完成笔画（正常抬笔后的 `lostpointercapture` 不会误伤）。
 - **橡皮**：命中即删整条笔画；一次擦除经过的所有删除合并为一个可撤销操作。
+- **局部擦除**：橡皮圆盘与原始采样中心线求交，线段穿越即切断（两端都在盘外也切断）；一次按下到抬起内的所有切割与删除合并为一个可撤销操作；片段换新 id 并清空平滑缓存，旧平滑结果无法恢复切割前形状；会使文档超过两万点的单次切割整体放弃，不留部分完成的操作。
 - **平滑代次**：Worker 结果携带 `(strokeId, gen)`，仅当代次匹配且笔画存在时应用——旧结果不能复活已擦除的笔画；平滑只写渲染缓存，不改保存的采样。
 - **重绘纯度**：渲染只读文档；采样以世界坐标保存，视图变换不影响已存数据。
 
@@ -39,6 +41,7 @@ npm run build    # 类型检查 + 生产构建
 - `prediction.test.ts`：预测点仅预览，不进保存/擦除/导出；无预测能力的事件源正常回退。
 - `transform.test.ts`：坐标变换互逆、锚点缩放、世界坐标保存、重绘不改写采样。
 - `eraseUndo.test.ts`：一次擦除多条笔画合并为单个撤销操作、命中半径、撤销顺序。
+- `partialErase.test.ts`：两端在盘外的线段切断、切口压力/时间插值、擦开后不跨缺口连线、相切不切断、孤立点保留、多次穿越拆分、一次拖动一次撤销、缩放后命中同一世界位置、旧平滑结果不恢复旧形状、超限切割整体放弃。
 - `cancel.test.ts`：取消/失去捕获回退、第二指针忽略。
 - `smoothing.test.ts`：代次验收、擦除后旧结果不复活、撤销后按新代次重新平滑。
 - `document.test.ts`：两万点上限截断、撤销释放预算、导出内容、代次推进规则。
